@@ -38,6 +38,13 @@ From [WildFlash1st/cmp90hx-unlock](https://github.com/WildFlash1st/cmp90hx-unloc
 
 ## Usage
 
+### Clone the repository
+
+```bash
+git clone https://github.com/vnadein/cmp90hx_deploy.git
+cd cmp90hx_deploy
+```
+
 ### First-time full deployment
 
 ```bash
