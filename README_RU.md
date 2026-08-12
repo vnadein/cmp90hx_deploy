@@ -43,6 +43,7 @@
 ```bash
 git clone https://github.com/vnadein/cmp90hx_deploy.git
 cd cmp90hx_deploy
+chmod +x cmp90hx-deploy.sh
 ```
 
 ### Полное развёртывание в первый раз
