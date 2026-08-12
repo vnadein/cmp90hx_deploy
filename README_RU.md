@@ -38,6 +38,13 @@
 
 ## Использование
 
+### Клонирование репозитория
+
+```bash
+git clone https://github.com/vnadein/cmp90hx_deploy.git
+cd cmp90hx_deploy
+```
+
 ### Полное развёртывание в первый раз
 
 ```bash
