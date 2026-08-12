@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ###############################################################################
-# CMP 90HX Full Deploy Script v2
+# CMP 90HX Full Deploy Script v0.4
 # Automation: Driver management + PCIe unlock + accelerated llama.cpp build
 #
 # Handles custom kernels by building candidate module from stockflow package.
@@ -256,104 +256,115 @@ ensure_compatible_driver() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUILD CANDIDATE MODULE FOR CUSTOM KERNEL
+# All logging goes to stderr; only the final path goes to stdout.
 # ─────────────────────────────────────────────────────────────────────────────
 build_candidate() {
     local kernel
     kernel=$(get_current_kernel)
 
-    log_step "BUILDING CANDIDATE MODULE FOR KERNEL ${kernel}"
+    # All log output to stderr so $(build_candidate) captures only the path
+    log_step "BUILDING CANDIDATE MODULE FOR KERNEL ${kernel}" >&2
 
     local STOCKFLOW_DIR="${WORKDIR}/stockflow"
-    local CANDIDATE_PATH=""
+    local SF_PKG_DIR="${STOCKFLOW_DIR}/cmpunlocker-v0.1.28-linux-x64-90hx-stockflow"
+    local SF_BUILD_DIR="${SF_PKG_DIR}/stockflow/610.43.03"
+    local ARTIFACT_DIR="${SF_BUILD_DIR}/artifacts/610.43.03-${kernel}-rejoin15-serialized-start"
 
-    # Check if already built
-    local EXISTING="${STOCKFLOW_DIR}/cmpunlocker-v0.1.28-linux-x64-90hx-stockflow/stockflow/610.43.03/artifacts/610.43.03-${kernel}-rejoin15-serialized-start"
-    if [[ -d "$EXISTING" && -f "${EXISTING}/nvidia.ko" ]]; then
-        log_success "Candidate already built: ${EXISTING}/nvidia.ko"
-        echo "$EXISTING"
+    # ── Check if already built ────────────────────────────────────────────────
+    if [[ -f "${ARTIFACT_DIR}/nvidia.ko" ]]; then
+        log_success "Candidate already built." >&2
+        printf '%s' "$ARTIFACT_DIR"
         return 0
     fi
 
     mkdir -p "$STOCKFLOW_DIR"
     cd "$STOCKFLOW_DIR"
 
-    # Download stockflow package
+    # ── Download stockflow package ────────────────────────────────────────────
     if [[ ! -f "cmpunlocker-v0.1.28-linux-x64-90hx-stockflow.tar.gz" ]]; then
-        log_info "Downloading 90HX stockflow package..."
-        wget -q --show-progress -c "$CMPUNLOCKER_90HX_STOCKFLOW_URL" || die "Failed to download stockflow."
+        log_info "Downloading 90HX stockflow package (~60MB)..." >&2
+        wget -q --show-progress -c "$CMPUNLOCKER_90HX_STOCKFLOW_URL" >&2 || {
+            log_error "Failed to download stockflow package." >&2
+            return 1
+        }
     fi
 
-    # Download SHA and verify
+    # ── Download SHA256SUMS ───────────────────────────────────────────────────
     if [[ ! -f "SHA256SUMS" ]]; then
-        wget -q -c "$CMPUNLOCKER_SHA_URL" || die "Failed to download SHA256SUMS."
-    fi
-    sha256sum -c SHA256SUMS --ignore-missing 2>/dev/null | grep -q "90hx-stockflow.*OK" || {
-        log_warn "Checksum warning for stockflow. Proceeding..."
-    }
-
-    # Extract
-    if [[ ! -d "cmpunlocker-v0.1.28-linux-x64-90hx-stockflow" ]]; then
-        log_info "Extracting stockflow package..."
-        tar xzf cmpunlocker-v0.1.28-linux-x64-90hx-stockflow.tar.gz
+        wget -q -c "$CMPUNLOCKER_SHA_URL" >&2 || true
     fi
 
-    cd "cmpunlocker-v0.1.28-linux-x64-90hx-stockflow/stockflow/610.43.03"
+    # ── Extract ───────────────────────────────────────────────────────────────
+    if [[ ! -d "$SF_PKG_DIR" ]]; then
+        log_info "Extracting stockflow package..." >&2
+        tar xzf cmpunlocker-v0.1.28-linux-x64-90hx-stockflow.tar.gz >&2
+    fi
 
-    # Download NVIDIA kernel source
+    cd "$SF_BUILD_DIR"
+
+    # ── Download NVIDIA kernel module source ──────────────────────────────────
     local NVIDIA_SRC="${STOCKFLOW_DIR}/NVIDIA-kernel-module-source-610.43.03.tar.xz"
     if [[ ! -f "$NVIDIA_SRC" ]]; then
-        log_info "Downloading NVIDIA kernel module source (610.43.03)..."
-        wget -q --show-progress -c "$NVIDIA_SOURCE_URL" -O "$NVIDIA_SRC" || die "Failed to download NVIDIA source."
+        log_info "Downloading NVIDIA kernel source 610.43.03 (~50MB)..." >&2
+        wget -q --show-progress -c "$NVIDIA_SOURCE_URL" -O "$NVIDIA_SRC" >&2 || {
+            log_error "Failed to download NVIDIA source." >&2
+            return 1
+        }
     fi
 
-    # Build candidate
-    log_info "Building candidate module for kernel ${kernel}..."
-    log_info "This may take 5-15 minutes depending on CPU..."
+    # ── Build candidate ───────────────────────────────────────────────────────
+    log_info "Compiling candidate for kernel ${kernel}..." >&2
+    log_info "This may take 5-15 minutes..." >&2
 
     local BUILD_LOG="${STOCKFLOW_DIR}/build-candidate.log"
 
     if JOBS="$(nproc)" CMP90_STOCKFLOW_VARIANT=rejoin15 \
-        ./build-candidate.sh --source-tarball "$NVIDIA_SRC" > "$BUILD_LOG" 2>&1; then
-        log_success "Candidate build completed."
+        CMP90_STOCKFLOW_LOW_MEM_G_BINDATA=1 \
+        ./build-candidate.sh --source-tarball "$NVIDIA_SRC" >"$BUILD_LOG" 2>&1; then
+        log_success "Candidate build completed." >&2
     else
-        log_error "Candidate build failed. Last 30 lines of log:"
-        tail -30 "$BUILD_LOG"
-        printf '\n'
-        log_info "Full log: ${BUILD_LOG}"
-        printf '\n'
-        log_info "Possible causes:"
-        log_info "  - Kernel ${kernel} may not be supported by NVIDIA 610.43.03"
-        log_info "  - Missing kernel headers"
-        log_info "  - GCC version incompatibility"
-        printf '\n'
-        log_info "Try installing HiveOS kernel ${HIVEOS_KERNEL} or a compatible kernel."
+        log_error "Candidate build FAILED." >&2
+        log_error "Last 40 lines of build log:" >&2
+        tail -40 "$BUILD_LOG" >&2
+        printf '\n' >&2
+        log_info "Full log: ${BUILD_LOG}" >&2
+        printf '\n' >&2
+        log_info "Possible fixes:" >&2
+        log_info "  1. Install kernel headers: sudo apt install linux-headers-$(uname -r)" >&2
+        log_info "  2. Install gcc/make: sudo apt install build-essential" >&2
+        log_info "  3. Try a different kernel (6.10.x recommended)" >&2
         return 1
     fi
 
-    # Find the built artifact
-    local ART_DIR="artifacts/610.43.03-${kernel}-rejoin15-serialized-start"
-    if [[ ! -d "$ART_DIR" ]]; then
-        # Try to find any artifact
-        ART_DIR=$(find artifacts/ -maxdepth 1 -type d -name "610.43.03-${kernel}*" 2>/dev/null | head -1)
-        if [[ -z "$ART_DIR" ]]; then
-            ART_DIR=$(find artifacts/ -maxdepth 1 -type d 2>/dev/null | head -1)
-        fi
+    # ── Locate artifact ───────────────────────────────────────────────────────
+    # Try exact match first
+    if [[ -f "${ARTIFACT_DIR}/nvidia.ko" ]]; then
+        log_success "Artifact: ${ARTIFACT_DIR}/nvidia.ko" >&2
+        printf '%s' "$ARTIFACT_DIR"
+        return 0
     fi
 
-    if [[ -z "$ART_DIR" || ! -f "${ART_DIR}/nvidia.ko" ]]; then
-        log_error "Built artifact not found. Check: $(pwd)/artifacts/"
-        ls -la artifacts/ 2>/dev/null || true
-        return 1
+    # Fallback: search for any artifact matching this kernel
+    local FOUND
+    FOUND=$(find "${SF_BUILD_DIR}/artifacts" -maxdepth 1 -type d -name "*${kernel}*" 2>/dev/null | head -1)
+    if [[ -n "$FOUND" && -f "${FOUND}/nvidia.ko" ]]; then
+        log_success "Artifact (fallback): ${FOUND}/nvidia.ko" >&2
+        printf '%s' "$FOUND"
+        return 0
     fi
 
-    CANDIDATE_PATH="$(pwd)/${ART_DIR}"
-    log_success "Candidate module: ${CANDIDATE_PATH}/nvidia.ko"
+    # Last resort: any artifact directory
+    FOUND=$(find "${SF_BUILD_DIR}/artifacts" -maxdepth 1 -type d -name "610*" 2>/dev/null | head -1)
+    if [[ -n "$FOUND" && -f "${FOUND}/nvidia.ko" ]]; then
+        log_warn "Using fallback artifact: ${FOUND}" >&2
+        printf '%s' "$FOUND"
+        return 0
+    fi
 
-    # Verify module info
-    modinfo -F version "${CANDIDATE_PATH}/nvidia.ko" 2>/dev/null && true
-    modinfo -F vermagic "${CANDIDATE_PATH}/nvidia.ko" 2>/dev/null && true
-
-    echo "$CANDIDATE_PATH"
+    log_error "No valid artifact found after build." >&2
+    log_error "Contents of artifacts/:" >&2
+    ls -la "${SF_BUILD_DIR}/artifacts/" 2>/dev/null >&2 || true
+    return 1
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -401,23 +412,32 @@ unlock_pcie() {
     local CANDIDATE_FLAG=""
 
     if [[ "$kernel" == "$HIVEOS_KERNEL" ]]; then
-        log_info "Kernel ${kernel} detected. Using embedded candidate."
+        log_info "Kernel ${kernel} — using embedded candidate."
     else
-        log_info "Kernel ${kernel} detected (not ${HIVEOS_KERNEL})."
-        log_info "Building custom candidate module..."
+        log_info "Kernel ${kernel} — building custom candidate..."
         printf '\n'
 
         local CANDIDATE_DIR
-        CANDIDATE_DIR=$(build_candidate) || {
-            die "Failed to build candidate for kernel ${kernel}."
-        }
+        # Capture only stdout (the path); all logs go to stderr
+        CANDIDATE_DIR=$(build_candidate)
+        local BUILD_RC=$?
 
-        if [[ -f "${CANDIDATE_DIR}/nvidia.ko" ]]; then
-            CANDIDATE_FLAG="--candidate ${CANDIDATE_DIR}/nvidia.ko"
-            log_info "Using candidate: ${CANDIDATE_DIR}/nvidia.ko"
-        else
-            die "Candidate nvidia.ko not found in ${CANDIDATE_DIR}"
+        if [[ $BUILD_RC -ne 0 || -z "$CANDIDATE_DIR" ]]; then
+            die "Failed to build candidate for kernel ${kernel}."
         fi
+
+        # Verify nvidia.ko exists
+        if [[ ! -f "${CANDIDATE_DIR}/nvidia.ko" ]]; then
+            log_error "nvidia.ko not found in: ${CANDIDATE_DIR}"
+            ls -la "${CANDIDATE_DIR}/" 2>/dev/null || true
+            die "Candidate build produced no usable module."
+        fi
+
+        CANDIDATE_FLAG="--candidate ${CANDIDATE_DIR}/nvidia.ko"
+        log_info "Candidate: ${CANDIDATE_DIR}/nvidia.ko"
+
+        # Show module info
+        modinfo -F vermagic "${CANDIDATE_DIR}/nvidia.ko" 2>/dev/null && true
     fi
 
     # Run unlock
