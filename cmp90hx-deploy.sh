@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 ###############################################################################
-# CMP 90HX Full Deploy Script
+# CMP 90HX Full Deploy Script v2
 # Automation: Driver management + PCIe unlock + accelerated llama.cpp build
+#
+# Handles custom kernels by building candidate module from stockflow package.
 #
 # Usage:
 #   sudo ./cmp90hx-deploy.sh --all          # Full deploy (driver + unlock + build)
@@ -26,20 +28,20 @@ set -euo pipefail
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 CMPUNLOCKER_VERSION="v0.1.28"
-CMPUNLOCKER_URL="https://github.com/pearlfortune/cmpunlocker/releases/download/${CMPUNLOCKER_VERSION}/cmpunlocker-v0.1.28-linux-x64-cli.tar.gz"
+CMPUNLOCKER_CLI_URL="https://github.com/pearlfortune/cmpunlocker/releases/download/${CMPUNLOCKER_VERSION}/cmpunlocker-v0.1.28-linux-x64-cli.tar.gz"
+CMPUNLOCKER_90HX_STOCKFLOW_URL="https://github.com/pearlfortune/cmpunlocker/releases/download/${CMPUNLOCKER_VERSION}/cmpunlocker-v0.1.28-linux-x64-90hx-stockflow.tar.gz"
 CMPUNLOCKER_SHA_URL="https://github.com/pearlfortune/cmpunlocker/releases/download/${CMPUNLOCKER_VERSION}/SHA256SUMS"
+NVIDIA_SOURCE_URL="https://download.nvidia.com/XFree86/NVIDIA-kernel-module-source/NVIDIA-kernel-module-source-610.43.03.tar.xz"
+NVIDIA_DL_BASE="https://download.nvidia.com/XFree86/Linux-x86_64"
+
 LLAMA_REPO="https://github.com/ggml-org/llama.cpp.git"
 LLAMA_DIR="${HOME}/llama.cpp-cmp90hx"
-CMPUNLOCKER_WORKDIR="/var/tmp/cmpunlocker-deploy"
-DRIVER_WORKDIR="/var/tmp/cmp90hx-driver"
+WORKDIR="/var/tmp/cmp90hx-deploy"
 CUDA_ARCH="86"
 
-# Supported driver versions for cmpunlocker
 SUPPORTED_DRIVERS=("580.159.03" "610.43.03")
 RECOMMENDED_DRIVER="610.43.03"
-
-# NVIDIA driver download base URL
-NVIDIA_DL_BASE="https://download.nvidia.com/XFree86/Linux-x86_64"
+HIVEOS_KERNEL="6.10.0-hiveos"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COLORS
@@ -82,21 +84,16 @@ check_root() {
 }
 
 check_linux() {
-    if [[ "$(uname -s)" != "Linux" ]]; then
-        die "This script only supports Linux x86_64."
-    fi
-    if [[ "$(uname -m)" != "x86_64" ]]; then
-        die "This script only supports x86_64 architecture."
-    fi
+    [[ "$(uname -s)" == "Linux" ]] || die "Only Linux x86_64 supported."
+    [[ "$(uname -m)" == "x86_64" ]] || die "Only x86_64 architecture supported."
 }
 
 check_cmp90hx_present() {
-    log_info "Checking for CMP 90HX in system..."
+    log_info "Checking for CMP 90HX..."
     if lspci -nn 2>/dev/null | grep -qi "10de:220d\|10de:1555"; then
         log_success "CMP 90HX detected."
-        lspci -nn | grep -i "10de:220d\|10de:1555"
     else
-        die "CMP 90HX (10de:220d / 10de:1555) not found. Ensure the card is seated in a PCIe slot."
+        die "CMP 90HX (10de:220d / 10de:1555) not found."
     fi
 }
 
@@ -104,100 +101,63 @@ get_current_driver_version() {
     modinfo -F version nvidia 2>/dev/null || echo ""
 }
 
+get_current_kernel() {
+    uname -r
+}
+
 is_driver_supported() {
     local ver="$1"
-    for supported in "${SUPPORTED_DRIVERS[@]}"; do
-        if [[ "$ver" == "$supported" ]]; then
-            return 0
-        fi
+    for s in "${SUPPORTED_DRIVERS[@]}"; do
+        [[ "$ver" == "$s" ]] && return 0
     done
     return 1
 }
 
-check_nvidia_driver() {
-    log_info "Checking NVIDIA driver..."
-    if ! command -v nvidia-smi &>/dev/null; then
-        log_warn "nvidia-smi not found. NVIDIA driver may not be installed."
-        return 1
-    fi
-
-    local driver_version
-    driver_version=$(get_current_driver_version)
-
-    if [[ -z "$driver_version" ]]; then
-        log_warn "Could not determine NVIDIA driver version."
-        return 1
-    fi
-
-    log_success "NVIDIA driver version: ${driver_version}"
-
-    if is_driver_supported "$driver_version"; then
-        log_success "Driver ${driver_version} is supported by cmpunlocker."
-        return 0
-    else
-        log_warn "Driver ${driver_version} is NOT supported."
-        log_warn "Supported versions: ${SUPPORTED_DRIVERS[*]}"
-        return 1
-    fi
-}
-
-check_cuda_toolkit() {
-    log_info "Checking CUDA Toolkit..."
-    if command -v nvcc &>/dev/null; then
-        local cuda_ver
-        cuda_ver=$(nvcc --version 2>/dev/null | grep "release" | sed 's/.*release //' | sed 's/,.*//')
-        log_success "CUDA Toolkit: ${cuda_ver}"
-    else
-        log_warn "nvcc not found in PATH. Checking standard locations..."
-        if [[ -f /usr/local/cuda/bin/nvcc ]]; then
-            export PATH="/usr/local/cuda/bin:$PATH"
-            export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
-            log_success "CUDA found at /usr/local/cuda"
-        else
-            die "CUDA Toolkit not found. Install: sudo apt install nvidia-cuda-toolkit"
-        fi
-    fi
+is_hiveos_kernel() {
+    [[ "$(get_current_kernel)" == "$HIVEOS_KERNEL" ]]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Install dependencies
+# DEPENDENCIES
 # ─────────────────────────────────────────────────────────────────────────────
 install_deps() {
     log_step "INSTALLING DEPENDENCIES"
 
-    local deps=(wget tar gzip git cmake build-essential python3 kmod coreutils binutils)
+    local deps=(wget tar gzip git cmake build-essential python3 kmod coreutils
+                binutils make gcc patch xz-utils)
 
-    # Check kernel headers
+    # Kernel headers check
     if [[ ! -d "/lib/modules/$(uname -r)/build" ]]; then
-        log_warn "Kernel headers not found. Attempting installation..."
+        log_warn "Kernel headers not found for $(uname -r). Installing..."
         if command -v apt-get &>/dev/null; then
+            apt-get update -qq
             apt-get install -y "linux-headers-$(uname -r)" 2>/dev/null || {
-                log_warn "Could not install kernel headers for $(uname -r)."
-                log_warn "Trying generic headers..."
+                log_warn "Trying linux-headers-generic..."
                 apt-get install -y linux-headers-generic 2>/dev/null || true
             }
         fi
     fi
 
+    if [[ ! -d "/lib/modules/$(uname -r)/build" ]]; then
+        die "Kernel headers still not found. Install manually: sudo apt install linux-headers-$(uname -r)"
+    fi
+    log_success "Kernel headers found: /lib/modules/$(uname -r)/build"
+
     if command -v apt-get &>/dev/null; then
-        log_info "Installing dependencies via apt..."
+        log_info "Installing packages via apt..."
         apt-get update -qq 2>/dev/null
         apt-get install -y "${deps[@]}" 2>/dev/null || true
     elif command -v dnf &>/dev/null; then
-        log_info "Installing dependencies via dnf..."
-        dnf install -y wget tar gzip git cmake gcc gcc-c++ make python3 kmod coreutils binutils 2>/dev/null || true
+        dnf install -y "${deps[@]}" 2>/dev/null || true
     elif command -v pacman &>/dev/null; then
-        log_info "Installing dependencies via pacman..."
-        pacman -Sy --noconfirm wget tar gzip git cmake base-devel python kmod coreutils binutils 2>/dev/null || true
-    else
-        log_warn "Unknown package manager. Ensure installed: ${deps[*]}"
+        pacman -Sy --noconfirm "${deps[@]}" 2>/dev/null || true
     fi
 
-    log_success "Dependencies checked/installed."
+    log_success "Dependencies installed."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Install compatible NVIDIA driver
+# DRIVER MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 install_driver() {
     log_step "NVIDIA DRIVER MANAGEMENT"
@@ -208,283 +168,275 @@ install_driver() {
     local current_version
     current_version=$(get_current_driver_version)
 
-    # Check if current driver is already supported
     if [[ -n "$current_version" ]] && is_driver_supported "$current_version"; then
-        log_success "Current driver ${current_version} is already supported. No action needed."
+        log_success "Driver ${current_version} is already supported."
         return 0
     fi
 
-    # Show current state
     if [[ -n "$current_version" ]]; then
         log_warn "Current driver: ${current_version} (NOT SUPPORTED)"
     else
-        log_warn "No NVIDIA driver detected or version unknown."
+        log_warn "No NVIDIA driver detected."
     fi
 
     printf '\n'
-    printf '  Supported driver versions for CMP 90HX unlock:\n'
-    printf '\n'
-    printf '    %s1)%s NVIDIA Open %s610.43.03%s (recommended, latest)\n' "$GREEN" "$NC" "$BOLD" "$NC"
+    printf '  Supported drivers for CMP 90HX unlock:\n\n'
+    printf '    %s1)%s NVIDIA Open %s610.43.03%s (recommended)\n' "$GREEN" "$NC" "$BOLD" "$NC"
     printf '    %s2)%s NVIDIA Open %s580.159.03%s (stable, older)\n' "$GREEN" "$NC" "$BOLD" "$NC"
-    printf '    %s3)%s Skip driver installation (proceed at your own risk)\n' "$YELLOW" "$NC"
+    printf '    %s3)%s Skip driver installation\n' "$YELLOW" "$NC"
     printf '\n'
-    printf '  Note: This will install NVIDIA Open Kernel Modules.\n'
-    printf '  Your current driver will be replaced.\n'
-    printf '\n'
-    printf '  Select option [1/2/3]: '
-    read -r driver_choice
+    printf '  Select [1/2/3]: '
+    read -r choice
 
-    local target_version=""
-    case "$driver_choice" in
-        1) target_version="610.43.03" ;;
-        2) target_version="580.159.03" ;;
-        3)
-            log_warn "Skipping driver installation. Unlock may fail."
-            return 1
-            ;;
-        *)
-            log_warn "Invalid choice. Using recommended: ${RECOMMENDED_DRIVER}"
-            target_version="$RECOMMENDED_DRIVER"
-            ;;
+    local target=""
+    case "$choice" in
+        1) target="610.43.03" ;;
+        2) target="580.159.03" ;;
+        3) log_warn "Skipping."; return 1 ;;
+        *) target="$RECOMMENDED_DRIVER" ;;
     esac
 
     printf '\n'
-    log_info "Selected driver: NVIDIA Open ${target_version}"
-    printf '\n'
-    printf '  WARNING: This will:\n'
-    printf '    1. Stop all GPU processes\n'
-    printf '    2. Unload current NVIDIA driver\n'
-    printf '    3. Download and install NVIDIA Open %s\n' "$target_version"
-    printf '    4. Reboot may be required\n'
-    printf '\n'
-    printf '  Continue with driver installation? (y/N): '
+    printf '  Install NVIDIA Open %s? (y/N): ' "$target"
     read -r confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        log_info "Driver installation cancelled."
-        return 1
+    [[ "$confirm" =~ ^[Yy]$ ]] || { log_info "Cancelled."; return 1; }
+
+    mkdir -p "$WORKDIR/driver"
+    cd "$WORKDIR/driver"
+
+    local FILE="NVIDIA-Linux-x86_64-${target}.run"
+    local URL="${NVIDIA_DL_BASE}/${target}/${FILE}"
+
+    if [[ ! -f "$FILE" ]]; then
+        log_info "Downloading ${FILE}..."
+        wget -q --show-progress -c "$URL" || die "Download failed."
     fi
+    chmod +x "$FILE"
 
-    # Create work directory
-    mkdir -p "$DRIVER_WORKDIR"
-    cd "$DRIVER_WORKDIR"
-
-    local DRIVER_FILE="NVIDIA-Linux-x86_64-${target_version}.run"
-    local DRIVER_URL="${NVIDIA_DL_BASE}/${target_version}/${DRIVER_FILE}"
-
-    # Download driver
-    if [[ ! -f "$DRIVER_FILE" ]]; then
-        log_info "Downloading NVIDIA driver ${target_version}..."
-        log_info "URL: ${DRIVER_URL}"
-        wget -q --show-progress -c "$DRIVER_URL" || die "Failed to download driver from ${DRIVER_URL}"
-    else
-        log_info "Driver file already exists: ${DRIVER_FILE}"
-    fi
-
-    # Verify file exists and is not empty
-    if [[ ! -s "$DRIVER_FILE" ]]; then
-        die "Downloaded driver file is empty. Remove ${DRIVER_WORKDIR}/${DRIVER_FILE} and retry."
-    fi
-
-    local file_size
-    file_size=$(stat -f%z "$DRIVER_FILE" 2>/dev/null || stat -c%s "$DRIVER_FILE" 2>/dev/null)
-    log_info "Driver file size: $(( file_size / 1024 / 1024 )) MB"
-
-    if (( file_size < 100000000 )); then
-        die "Driver file too small (<100MB). Download may be corrupted."
-    fi
-
-    chmod +x "$DRIVER_FILE"
-
-    # Stop GPU processes
-    log_info "Stopping GPU processes..."
-    if command -v systemctl &>/dev/null; then
-        # Stop common GPU services
-        systemctl stop nvidia-persistenced 2>/dev/null || true
-        systemctl stop nvidia-fabricmanager 2>/dev/null || true
-    fi
-
-    # Kill any processes using NVIDIA devices
-    if command -v fuser &>/dev/null; then
-        fuser -v /dev/nvidia* 2>/dev/null && {
-            log_info "Killing processes using NVIDIA devices..."
-            fuser -k /dev/nvidia* 2>/dev/null || true
-            sleep 2
-        }
-    fi
-
-    # Unload NVIDIA kernel modules
-    log_info "Unloading NVIDIA kernel modules..."
-    rmmod nvidia_uvm 2>/dev/null || true
-    rmmod nvidia_drm 2>/dev/null || true
-    rmmod nvidia_modeset 2>/dev/null || true
-    rmmod nvidia 2>/dev/null || true
+    log_info "Stopping GPU processes and unloading modules..."
+    systemctl stop nvidia-persistenced 2>/dev/null || true
+    fuser -k /dev/nvidia* 2>/dev/null || true
+    sleep 1
+    rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>/dev/null || true
     sleep 2
 
-    # Check if modules are unloaded
     if lsmod | grep -q "^nvidia "; then
-        log_warn "nvidia module still loaded. Attempting force unload..."
-        rmmod -f nvidia 2>/dev/null || {
-            die "Cannot unload nvidia module. Close all GPU applications and retry, or reboot."
-        }
+        die "Cannot unload nvidia module. Close GPU apps or reboot first."
     fi
 
-    # Install driver with Open Kernel Modules
-    log_info "Installing NVIDIA Open Kernel Modules ${target_version}..."
-    log_info "This may take several minutes..."
-    printf '\n'
-
-    # Run installer
-    # --silent: no interactive prompts
-    # --kernel-module-type=open: use open-source kernel module
-    # --no-questions: skip questions
-    # --disable-nouveau: blacklist nouveau
-    # --no-cc-version-check: skip compiler version check (for newer kernels)
-    # --kernel-source-path: specify kernel headers if needed
-    local install_flags=(
-        --silent
-        --kernel-module-type=open
-        --no-questions
-        --disable-nouveau
-        --no-cc-version-check
-        --install-libglvnd
-    )
-
-    # Add kernel source path if available
-    if [[ -d "/lib/modules/$(uname -r)/build" ]]; then
-        install_flags+=(--kernel-source-path="/lib/modules/$(uname -r)/build")
-    fi
-
-    if "./${DRIVER_FILE}" "${install_flags[@]}"; then
-        log_success "Driver installation completed!"
+    log_info "Installing NVIDIA Open ${target} (this takes several minutes)..."
+    if "./${FILE}" --silent --kernel-module-type=open --no-questions \
+        --disable-nouveau --no-cc-version-check --install-libglvnd; then
+        log_success "Driver installed!"
     else
-        local exit_code=$?
-        log_error "Driver installation failed with exit code: ${exit_code}"
-        log_error "Check /var/log/nvidia-installer.log for details."
+        die "Driver install failed. Check /var/log/nvidia-installer.log"
+    fi
+
+    modprobe nvidia 2>/dev/null || {
+        log_warn "Reboot required to load new driver."
+        printf '  Run: sudo reboot && sudo %s --all\n' "$0"
+        return 0
+    }
+    sleep 3
+
+    local new_ver
+    new_ver=$(get_current_driver_version)
+    log_success "Driver loaded: ${new_ver}"
+}
+
+ensure_compatible_driver() {
+    local ver
+    ver=$(get_current_driver_version)
+    if [[ -n "$ver" ]] && is_driver_supported "$ver"; then
+        log_success "Driver ${ver} compatible."
+        return 0
+    fi
+    install_driver
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD CANDIDATE MODULE FOR CUSTOM KERNEL
+# ─────────────────────────────────────────────────────────────────────────────
+build_candidate() {
+    local kernel
+    kernel=$(get_current_kernel)
+
+    log_step "BUILDING CANDIDATE MODULE FOR KERNEL ${kernel}"
+
+    local STOCKFLOW_DIR="${WORKDIR}/stockflow"
+    local CANDIDATE_PATH=""
+
+    # Check if already built
+    local EXISTING="${STOCKFLOW_DIR}/cmpunlocker-v0.1.28-linux-x64-90hx-stockflow/stockflow/610.43.03/artifacts/610.43.03-${kernel}-rejoin15-serialized-start"
+    if [[ -d "$EXISTING" && -f "${EXISTING}/nvidia.ko" ]]; then
+        log_success "Candidate already built: ${EXISTING}/nvidia.ko"
+        echo "$EXISTING"
+        return 0
+    fi
+
+    mkdir -p "$STOCKFLOW_DIR"
+    cd "$STOCKFLOW_DIR"
+
+    # Download stockflow package
+    if [[ ! -f "cmpunlocker-v0.1.28-linux-x64-90hx-stockflow.tar.gz" ]]; then
+        log_info "Downloading 90HX stockflow package..."
+        wget -q --show-progress -c "$CMPUNLOCKER_90HX_STOCKFLOW_URL" || die "Failed to download stockflow."
+    fi
+
+    # Download SHA and verify
+    if [[ ! -f "SHA256SUMS" ]]; then
+        wget -q -c "$CMPUNLOCKER_SHA_URL" || die "Failed to download SHA256SUMS."
+    fi
+    sha256sum -c SHA256SUMS --ignore-missing 2>/dev/null | grep -q "90hx-stockflow.*OK" || {
+        log_warn "Checksum warning for stockflow. Proceeding..."
+    }
+
+    # Extract
+    if [[ ! -d "cmpunlocker-v0.1.28-linux-x64-90hx-stockflow" ]]; then
+        log_info "Extracting stockflow package..."
+        tar xzf cmpunlocker-v0.1.28-linux-x64-90hx-stockflow.tar.gz
+    fi
+
+    cd "cmpunlocker-v0.1.28-linux-x64-90hx-stockflow/stockflow/610.43.03"
+
+    # Download NVIDIA kernel source
+    local NVIDIA_SRC="${STOCKFLOW_DIR}/NVIDIA-kernel-module-source-610.43.03.tar.xz"
+    if [[ ! -f "$NVIDIA_SRC" ]]; then
+        log_info "Downloading NVIDIA kernel module source (610.43.03)..."
+        wget -q --show-progress -c "$NVIDIA_SOURCE_URL" -O "$NVIDIA_SRC" || die "Failed to download NVIDIA source."
+    fi
+
+    # Build candidate
+    log_info "Building candidate module for kernel ${kernel}..."
+    log_info "This may take 5-15 minutes depending on CPU..."
+
+    local BUILD_LOG="${STOCKFLOW_DIR}/build-candidate.log"
+
+    if JOBS="$(nproc)" CMP90_STOCKFLOW_VARIANT=rejoin15 \
+        ./build-candidate.sh --source-tarball "$NVIDIA_SRC" > "$BUILD_LOG" 2>&1; then
+        log_success "Candidate build completed."
+    else
+        log_error "Candidate build failed. Last 30 lines of log:"
+        tail -30 "$BUILD_LOG"
         printf '\n'
-        log_info "Common fixes:"
-        log_info "  1. Ensure kernel headers are installed: sudo apt install linux-headers-$(uname -r)"
-        log_info "  2. Ensure gcc is installed: sudo apt install gcc"
-        log_info "  3. Disable Secure Boot in BIOS"
-        log_info "  4. Try manual install: sudo ./${DRIVER_FILE} --kernel-module-type=open"
+        log_info "Full log: ${BUILD_LOG}"
+        printf '\n'
+        log_info "Possible causes:"
+        log_info "  - Kernel ${kernel} may not be supported by NVIDIA 610.43.03"
+        log_info "  - Missing kernel headers"
+        log_info "  - GCC version incompatibility"
+        printf '\n'
+        log_info "Try installing HiveOS kernel ${HIVEOS_KERNEL} or a compatible kernel."
         return 1
     fi
 
-    # Load the new driver
-    log_info "Loading new NVIDIA driver..."
-    modprobe nvidia 2>/dev/null || {
-        log_warn "Could not load nvidia module. A reboot is required."
-        printf '\n'
-        printf '  %sPlease reboot your system and re-run this script:%s\n' "$BOLD" "$NC"
-        printf '    sudo reboot\n'
-        printf '    sudo %s --all\n' "$0"
-        printf '\n'
-        return 0
-    }
-
-    sleep 3
-
-    # Verify new driver
-    local new_version
-    new_version=$(get_current_driver_version)
-    if [[ "$new_version" == "$target_version" ]]; then
-        log_success "Driver ${new_version} installed and loaded successfully!"
-    else
-        log_warn "Driver version after install: ${new_version}"
-        log_warn "Expected: ${target_version}"
-        log_warn "A reboot may be required."
+    # Find the built artifact
+    local ART_DIR="artifacts/610.43.03-${kernel}-rejoin15-serialized-start"
+    if [[ ! -d "$ART_DIR" ]]; then
+        # Try to find any artifact
+        ART_DIR=$(find artifacts/ -maxdepth 1 -type d -name "610.43.03-${kernel}*" 2>/dev/null | head -1)
+        if [[ -z "$ART_DIR" ]]; then
+            ART_DIR=$(find artifacts/ -maxdepth 1 -type d 2>/dev/null | head -1)
+        fi
     fi
 
-    # Show nvidia-smi
-    printf '\n'
-    nvidia-smi 2>/dev/null || log_warn "nvidia-smi not available until reboot."
+    if [[ -z "$ART_DIR" || ! -f "${ART_DIR}/nvidia.ko" ]]; then
+        log_error "Built artifact not found. Check: $(pwd)/artifacts/"
+        ls -la artifacts/ 2>/dev/null || true
+        return 1
+    fi
 
-    return 0
+    CANDIDATE_PATH="$(pwd)/${ART_DIR}"
+    log_success "Candidate module: ${CANDIDATE_PATH}/nvidia.ko"
+
+    # Verify module info
+    modinfo -F version "${CANDIDATE_PATH}/nvidia.ko" 2>/dev/null && true
+    modinfo -F vermagic "${CANDIDATE_PATH}/nvidia.ko" 2>/dev/null && true
+
+    echo "$CANDIDATE_PATH"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Ensure compatible driver (auto-fix)
-# ─────────────────────────────────────────────────────────────────────────────
-ensure_compatible_driver() {
-    local current_version
-    current_version=$(get_current_driver_version)
-
-    if [[ -z "$current_version" ]]; then
-        log_warn "No NVIDIA driver detected."
-        install_driver
-        return $?
-    fi
-
-    if is_driver_supported "$current_version"; then
-        log_success "Driver ${current_version} is compatible."
-        return 0
-    fi
-
-    log_warn "Driver ${current_version} is NOT compatible with cmpunlocker."
-    log_warn "Supported: ${SUPPORTED_DRIVERS[*]}"
-    printf '\n'
-
-    install_driver
-    return $?
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Unlock PCIe + Compute
+# UNLOCK PCIe + COMPUTE
 # ─────────────────────────────────────────────────────────────────────────────
 unlock_pcie() {
-    log_step "UNLOCKING PCIe + COMPUTE (cmpunlocker ${CMPUNLOCKER_VERSION})"
+    log_step "UNLOCKING PCIe + COMPUTE"
 
     check_root
     check_cmp90hx_present
 
-    # Ensure driver is compatible before attempting unlock
-    if ! check_nvidia_driver; then
-        printf '\n'
-        log_warn "Incompatible driver detected. Attempting auto-fix..."
-        if ! ensure_compatible_driver; then
-            die "Cannot proceed with incompatible driver."
+    # Check driver
+    local drv
+    drv=$(get_current_driver_version)
+    if ! is_driver_supported "${drv:-}"; then
+        log_warn "Driver '${drv:-none}' not supported. Attempting fix..."
+        ensure_compatible_driver || die "Cannot proceed without compatible driver."
+        drv=$(get_current_driver_version)
+    fi
+    log_success "Using driver: ${drv}"
+
+    # Prepare cmpunlocker-rs binary
+    mkdir -p "$WORKDIR/cli"
+    cd "$WORKDIR/cli"
+
+    if [[ ! -f "cmpunlocker-rs" ]]; then
+        if [[ ! -f "cmpunlocker-v0.1.28-linux-x64-cli.tar.gz" ]]; then
+            log_info "Downloading cmpunlocker CLI..."
+            wget -q --show-progress -c "$CMPUNLOCKER_CLI_URL" || die "Download failed."
+            wget -q -c "$CMPUNLOCKER_SHA_URL" || true
         fi
-        # Re-check after driver install
-        if ! check_nvidia_driver; then
-            die "Driver still incompatible after installation attempt. Reboot and retry."
+        tar xzf cmpunlocker-v0.1.28-linux-x64-cli.tar.gz 2>/dev/null
+        if [[ -d "cmpunlocker-v0.1.28-linux-x64-cli" ]]; then
+            cp "cmpunlocker-v0.1.28-linux-x64-cli/cmpunlocker-rs" .
         fi
     fi
 
-    mkdir -p "$CMPUNLOCKER_WORKDIR"
-    cd "$CMPUNLOCKER_WORKDIR"
-
-    # Download binary if not present
-    if [[ ! -f "cmpunlocker-v0.1.28-linux-x64-cli.tar.gz" ]]; then
-        log_info "Downloading cmpunlocker ${CMPUNLOCKER_VERSION}..."
-        wget -q --show-progress -c "$CMPUNLOCKER_URL" || die "Failed to download cmpunlocker."
-        wget -q --show-progress -c "$CMPUNLOCKER_SHA_URL" || die "Failed to download SHA256SUMS."
+    if [[ ! -f "cmpunlocker-rs" ]]; then
+        die "cmpunlocker-rs binary not found after extraction."
     fi
 
-    # Verify checksum
-    log_info "Verifying checksum..."
-    if sha256sum -c SHA256SUMS --ignore-missing 2>/dev/null | grep -q "OK"; then
-        log_success "Checksum verified."
+    # Determine unlock strategy based on kernel
+    local kernel
+    kernel=$(get_current_kernel)
+    local CANDIDATE_FLAG=""
+
+    if [[ "$kernel" == "$HIVEOS_KERNEL" ]]; then
+        log_info "Kernel ${kernel} detected. Using embedded candidate."
     else
-        die "Checksum MISMATCH! File corrupted. Remove ${CMPUNLOCKER_WORKDIR} and retry."
-    fi
+        log_info "Kernel ${kernel} detected (not ${HIVEOS_KERNEL})."
+        log_info "Building custom candidate module..."
+        printf '\n'
 
-    # Extract
-    if [[ ! -d "cmpunlocker-v0.1.28-linux-x64-cli" ]]; then
-        log_info "Extracting archive..."
-        tar vxzf cmpunlocker-v0.1.28-linux-x64-cli.tar.gz
-    fi
+        local CANDIDATE_DIR
+        CANDIDATE_DIR=$(build_candidate) || {
+            die "Failed to build candidate for kernel ${kernel}."
+        }
 
-    cd cmpunlocker-v0.1.28-linux-x64-cli
+        if [[ -f "${CANDIDATE_DIR}/nvidia.ko" ]]; then
+            CANDIDATE_FLAG="--candidate ${CANDIDATE_DIR}/nvidia.ko"
+            log_info "Using candidate: ${CANDIDATE_DIR}/nvidia.ko"
+        else
+            die "Candidate nvidia.ko not found in ${CANDIDATE_DIR}"
+        fi
+    fi
 
     # Run unlock
+    printf '\n'
     log_info "Running CMP 90HX unlock..."
-    log_warn "This will temporarily modify GPU state. Ensure miners and CUDA tasks are stopped."
+    log_warn "Ensure miners and CUDA tasks are stopped."
 
-    if ./cmpunlocker-rs compute90hx-v67 run \
-        --all-cmp90hx \
-        --acknowledge I-ACCEPT-90HX-V67-COMPUTE-UNLOCK; then
-        log_success "Unlock command executed successfully!"
+    local UNLOCK_CMD="./cmpunlocker-rs compute90hx-v67 run --all-cmp90hx --acknowledge I-ACCEPT-90HX-V67-COMPUTE-UNLOCK"
+    if [[ -n "$CANDIDATE_FLAG" ]]; then
+        UNLOCK_CMD="${UNLOCK_CMD} ${CANDIDATE_FLAG}"
+    fi
+
+    log_info "Command: ${UNLOCK_CMD}"
+    printf '\n'
+
+    if eval "$UNLOCK_CMD"; then
+        log_success "Unlock command completed!"
     else
-        die "Unlock failed. Check /var/lib/cmpunlocker-rs/transactions/ for details."
+        die "Unlock failed. Check /var/lib/cmpunlocker-rs/transactions/"
     fi
 
     sleep 3
@@ -492,148 +444,76 @@ unlock_pcie() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Verify unlock
+# VERIFY UNLOCK
 # ─────────────────────────────────────────────────────────────────────────────
 verify_unlock() {
-    log_step "VERIFYING UNLOCK STATUS"
+    log_step "VERIFYING UNLOCK"
 
-    check_root
+    local BIN="${WORKDIR}/cli/cmpunlocker-rs"
+    [[ -f "$BIN" ]] || BIN="cmpunlocker-rs"
 
-    local BIN=""
-    if [[ -f "${CMPUNLOCKER_WORKDIR}/cmpunlocker-v0.1.28-linux-x64-cli/cmpunlocker-rs" ]]; then
-        BIN="${CMPUNLOCKER_WORKDIR}/cmpunlocker-v0.1.28-linux-x64-cli/cmpunlocker-rs"
-    elif command -v cmpunlocker-rs &>/dev/null; then
-        BIN="cmpunlocker-rs"
-    else
-        log_warn "cmpunlocker-rs not found. Downloading for verification..."
-        mkdir -p "$CMPUNLOCKER_WORKDIR"
-        cd "$CMPUNLOCKER_WORKDIR"
-        if [[ ! -f "cmpunlocker-v0.1.28-linux-x64-cli.tar.gz" ]]; then
-            wget -q -c "$CMPUNLOCKER_URL"
-            wget -q -c "$CMPUNLOCKER_SHA_URL"
-        fi
-        tar xzf cmpunlocker-v0.1.28-linux-x64-cli.tar.gz 2>/dev/null
-        BIN="${CMPUNLOCKER_WORKDIR}/cmpunlocker-v0.1.28-linux-x64-cli/cmpunlocker-rs"
-    fi
-
-    log_info "Running verification..."
     if "$BIN" compute90hx-v67 verify --all-cmp90hx --expect full; then
         log_success "UNLOCK CONFIRMED: PASS_CMP90HX_ALL_TARGETS_FULL_SPEED"
     else
-        log_error "Unlock NOT confirmed. Try rebooting and re-running."
+        log_error "Unlock NOT confirmed."
         return 1
     fi
 
     printf '\n'
-    log_info "Current GPU state (nvidia-smi):"
     nvidia-smi 2>/dev/null || true
-
     printf '\n'
-    log_info "PCIe link status:"
+    log_info "PCIe link:"
     nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current --format=csv 2>/dev/null || true
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Show GPU status
-# ─────────────────────────────────────────────────────────────────────────────
-show_status() {
-    log_step "CMP 90HX STATUS"
-
-    printf '\n'
-    log_info "NVIDIA PCI devices:"
-    lspci -nn | grep -i nvidia || true
-
-    printf '\n'
-    if command -v nvidia-smi &>/dev/null; then
-        log_info "nvidia-smi output:"
-        nvidia-smi
-        printf '\n'
-        log_info "PCIe link info:"
-        nvidia-smi --query-gpu=pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current --format=csv 2>/dev/null || true
-    else
-        log_warn "nvidia-smi not found."
-    fi
-
-    printf '\n'
-    local drv
-    drv=$(get_current_driver_version)
-    if [[ -n "$drv" ]]; then
-        log_info "Driver version: ${drv}"
-        if is_driver_supported "$drv"; then
-            log_success "Driver is SUPPORTED by cmpunlocker."
-        else
-            log_warn "Driver is NOT supported. Supported: ${SUPPORTED_DRIVERS[*]}"
-            log_warn "Run: sudo $0 --driver"
-        fi
-    else
-        log_warn "Could not determine driver version."
-    fi
-
-    printf '\n'
-    log_info "Kernel: $(uname -r)"
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Build llama.cpp with DP2A patch
+# BUILD llama.cpp
 # ─────────────────────────────────────────────────────────────────────────────
 build_llama() {
-    log_step "BUILDING llama.cpp WITH DP2A PATCH FOR CMP 90HX"
+    log_step "BUILDING llama.cpp WITH DP2A PATCH"
 
-    check_cuda_toolkit
+    command -v cmake &>/dev/null || die "cmake not found."
+    command -v git &>/dev/null || die "git not found."
 
-    if ! command -v cmake &>/dev/null; then
-        die "cmake not found. Install: sudo apt install cmake"
+    # CUDA check
+    if ! command -v nvcc &>/dev/null; then
+        if [[ -f /usr/local/cuda/bin/nvcc ]]; then
+            export PATH="/usr/local/cuda/bin:$PATH"
+        else
+            die "CUDA Toolkit not found. Install: sudo apt install nvidia-cuda-toolkit"
+        fi
     fi
-    if ! command -v git &>/dev/null; then
-        die "git not found. Install: sudo apt install git"
-    fi
 
-    # Clone or update repository
     if [[ -d "$LLAMA_DIR/.git" ]]; then
-        log_info "llama.cpp repo exists. Updating..."
+        log_info "Updating existing llama.cpp..."
         cd "$LLAMA_DIR"
         git stash 2>/dev/null || true
         git checkout main 2>/dev/null || git checkout master 2>/dev/null || true
-        git pull --ff-only 2>/dev/null || log_warn "Could not update. Using current version."
+        git pull --ff-only 2>/dev/null || true
         git checkout -- ggml/src/ggml-cuda/common.cuh 2>/dev/null || true
     else
-        log_info "Cloning llama.cpp into ${LLAMA_DIR}..."
+        log_info "Cloning llama.cpp..."
         git clone --depth=1 "$LLAMA_REPO" "$LLAMA_DIR"
         cd "$LLAMA_DIR"
     fi
 
     cd "$LLAMA_DIR"
-    log_info "Working directory: $(pwd)"
 
-    # ─── APPLY DP2A PATCH ────────────────────────────────────────────────────
-    log_info "Applying DP2A patch (replacing throttled DP4A with DP2A)..."
+    # Apply DP2A patch
+    local CUDA_FILE="ggml/src/ggml-cuda/common.cuh"
+    [[ -f "$CUDA_FILE" ]] || CUDA_FILE=$(find . -name "common.cuh" -path "*/ggml-cuda/*" | head -1)
+    [[ -f "$CUDA_FILE" ]] || die "common.cuh not found."
 
-    local CUDA_COMMON_FILE="ggml/src/ggml-cuda/common.cuh"
-
-    if [[ ! -f "$CUDA_COMMON_FILE" ]]; then
-        CUDA_COMMON_FILE=$(find . -name "common.cuh" -path "*/ggml-cuda/*" 2>/dev/null | head -1)
-        if [[ -z "$CUDA_COMMON_FILE" ]]; then
-            die "common.cuh not found in llama.cpp structure. Project layout has changed."
-        fi
-        log_info "Found alternative path: $CUDA_COMMON_FILE"
-    fi
-
-    if grep -q "DISABLE_DP4A" "$CUDA_COMMON_FILE" 2>/dev/null; then
-        log_warn "DP2A patch already applied. Skipping."
+    if grep -q "DISABLE_DP4A" "$CUDA_FILE" 2>/dev/null; then
+        log_warn "DP2A patch already applied."
     else
-        cat << 'PYTHON_PATCH_EOF' > /tmp/patch_cmp90hx_dp2a.py
+        python3 - "$CUDA_FILE" << 'PYEOF'
 import sys
-filepath = sys.argv[1]
-with open(filepath, 'r') as f:
-    content = f.read()
-
-old_code = """#if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
-    return __dp4a(a, b, c);"""
-
-old_code_alt = """#if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
-        return __dp4a(a, b, c);"""
-
-new_code = """#if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+fp = sys.argv[1]
+with open(fp) as f: c = f.read()
+old = '#if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)\n    return __dp4a(a, b, c);'
+old2 = '#if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)\n        return __dp4a(a, b, c);'
+new = '''#if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     #if defined(DISABLE_DP4A)
         int a_lo, a_hi;
         asm("prmt.b32 %0, %1, 0, 0x9180;" : "=r"(a_lo) : "r"(a));
@@ -644,106 +524,74 @@ new_code = """#if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
         return r;
     #else
         return __dp4a(a, b, c);
-    #endif"""
-
-if old_code in content:
-    content = content.replace(old_code, new_code)
-    with open(filepath, 'w') as f:
-        f.write(content)
-    print("PATCH_OK")
-elif old_code_alt in content:
-    content = content.replace(old_code_alt, new_code)
-    with open(filepath, 'w') as f:
-        f.write(content)
-    print("PATCH_OK")
+    #endif'''
+if old in c:
+    c = c.replace(old, new)
+elif old2 in c:
+    c = c.replace(old2, new)
 else:
-    print("PATCH_NOT_FOUND")
-PYTHON_PATCH_EOF
-
-        local patch_result
-        patch_result=$(python3 /tmp/patch_cmp90hx_dp2a.py "$CUDA_COMMON_FILE")
-        rm -f /tmp/patch_cmp90hx_dp2a.py
-
-        if [[ "$patch_result" == "PATCH_OK" ]]; then
-            log_success "DP2A patch applied successfully!"
-        else
-            die "Failed to apply patch. File structure has changed. Apply manually or update script."
-        fi
+    print("NOT_FOUND"); sys.exit(1)
+with open(fp, 'w') as f: f.write(c)
+print("OK")
+PYEOF
+        [[ $? -eq 0 ]] && log_success "DP2A patch applied." || die "Patch failed."
     fi
 
-    # ─── COMPILE ─────────────────────────────────────────────────────────────
-    log_info "Compiling llama.cpp with flags:"
-    log_info "  -DGGML_CUDA=ON"
-    log_info "  -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"
-    log_info "  -DCMAKE_CUDA_FLAGS=\"-DDISABLE_DP4A\""
-
+    # Compile
+    log_info "Compiling (sm_${CUDA_ARCH}, DISABLE_DP4A)..."
     rm -rf build
-
-    cmake -B build \
-        -DGGML_CUDA=ON \
-        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
-        -DCMAKE_CUDA_FLAGS="-DDISABLE_DP4A" \
-        -DCMAKE_BUILD_TYPE=Release
-
+    cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+          -DCMAKE_CUDA_FLAGS="-DDISABLE_DP4A" -DCMAKE_BUILD_TYPE=Release
     cmake --build build --config Release -j "$(nproc)"
 
-    if [[ -f "build/bin/llama-cli" ]]; then
-        log_success "Build completed successfully!"
-        printf '\n'
-        log_info "Binaries:"
-        log_info "  llama-cli:    ${LLAMA_DIR}/build/bin/llama-cli"
-        log_info "  llama-server: ${LLAMA_DIR}/build/bin/llama-server"
-        log_info "  llama-bench:  ${LLAMA_DIR}/build/bin/llama-bench"
-        printf '\n'
-        log_info "Benchmark example:"
-        log_info "  ${LLAMA_DIR}/build/bin/llama-bench -hf TheBloke/Llama-2-7B-GGUF:Q4_0 -p 512 -n 128 -ngl 99 -r 3"
-        printf '\n'
-        log_info "Chat example:"
-        log_info "  ${LLAMA_DIR}/build/bin/llama-cli -m /path/to/model.gguf -ngl 99 -t 8"
-    else
-        die "Build did not produce llama-cli. Check compilation errors above."
-    fi
+    [[ -f "build/bin/llama-cli" ]] && log_success "Build complete!" || die "Build failed."
+    printf '\n'
+    log_info "Binaries: ${LLAMA_DIR}/build/bin/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Run benchmark
+# BENCHMARK
 # ─────────────────────────────────────────────────────────────────────────────
 run_benchmark() {
-    log_step "BENCHMARKING llama.cpp ON CMP 90HX"
-
-    local BENCH_BIN="${LLAMA_DIR}/build/bin/llama-bench"
-
-    if [[ ! -f "$BENCH_BIN" ]]; then
-        die "llama-bench not found. Run first: $0 --build-llama"
-    fi
-
-    log_info "Running benchmark (Llama-2-7B Q4_0, pp512 + tg128)..."
-    log_info "Expected results for CMP 90HX with DP2A patch:"
-    log_info "  pp512: ~370-400 t/s (prompt processing)"
-    log_info "  tg128: ~100-120 t/s (token generation) <- ACCELERATED by patch!"
-    printf '\n'
-
-    "$BENCH_BIN" -hf TheBloke/Llama-2-7B-GGUF:Q4_0 -p 512 -n 128 -ngl 99 -r 3
+    log_step "BENCHMARK"
+    local B="${LLAMA_DIR}/build/bin/llama-bench"
+    [[ -f "$B" ]] || die "llama-bench not found. Run --build-llama first."
+    "$B" -hf TheBloke/Llama-2-7B-GGUF:Q4_0 -p 512 -n 128 -ngl 99 -r 3
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Full deployment
+# STATUS
+# ─────────────────────────────────────────────────────────────────────────────
+show_status() {
+    log_step "CMP 90HX STATUS"
+    lspci -nn | grep -i nvidia || true
+    printf '\n'
+    nvidia-smi 2>/dev/null || log_warn "nvidia-smi not available."
+    printf '\n'
+    nvidia-smi --query-gpu=pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current --format=csv 2>/dev/null || true
+    printf '\n'
+    local drv; drv=$(get_current_driver_version)
+    log_info "Driver: ${drv:-unknown}"
+    log_info "Kernel: $(get_current_kernel)"
+    if [[ -n "$drv" ]]; then
+        is_driver_supported "$drv" && log_success "Driver SUPPORTED." || log_warn "Driver NOT supported. Run: sudo $0 --driver"
+    fi
+    is_hiveos_kernel && log_info "Kernel is HiveOS (embedded candidate available)." \
+                     || log_info "Custom kernel (candidate build required for unlock)."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FULL DEPLOY
 # ─────────────────────────────────────────────────────────────────────────────
 deploy_all() {
     log_step "FULL CMP 90HX DEPLOYMENT"
-
-    printf '  Stage 1: Install dependencies\n'
-    printf '  Stage 2: Ensure compatible NVIDIA driver\n'
-    printf '  Stage 3: Unlock PCIe + Compute\n'
-    printf '  Stage 4: Verify unlock\n'
-    printf '  Stage 5: Build llama.cpp with DP2A patch\n'
-    printf '\n'
+    printf '  1. Install dependencies\n'
+    printf '  2. Ensure compatible driver\n'
+    printf '  3. Build candidate (if custom kernel)\n'
+    printf '  4. Unlock PCIe + Compute\n'
+    printf '  5. Build llama.cpp with DP2A patch\n\n'
     printf 'Continue? (y/N): '
-    read -r confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        log_info "Cancelled."
-        exit 0
-    fi
+    read -r c; [[ "$c" =~ ^[Yy]$ ]] || exit 0
 
     install_deps
     ensure_compatible_driver
@@ -751,89 +599,46 @@ deploy_all() {
     build_llama
 
     log_step "DEPLOYMENT COMPLETE!"
-    printf '\n'
-    printf '  [OK] Compatible driver installed\n'
-    printf '  [OK] PCIe unlocked (Gen3 x16)\n'
-    printf '  [OK] llama.cpp built with DP2A patch\n'
-    printf '\n'
     printf '  Binaries: %s/build/bin/\n' "$LLAMA_DIR"
-    printf '\n'
-    printf '  Quick test:\n'
-    printf '    %s/build/bin/llama-bench -hf TheBloke/Llama-2-7B-GGUF:Q4_0 -p 512 -n 128 -ngl 99\n' "$LLAMA_DIR"
-    printf '\n'
-    printf '  NOTE: Unlock is temporary. After reboot run:\n'
-    printf '    sudo %s --unlock\n' "$0"
-    printf '\n'
+    printf '  After reboot: sudo %s --unlock\n\n' "$0"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNCTION: Help
+# HELP
 # ─────────────────────────────────────────────────────────────────────────────
 show_help() {
-    printf '%s%sCMP 90HX Full Deploy Script%s\n\n' "$BOLD" "$CYAN" "$NC"
+    printf '%s%sCMP 90HX Full Deploy Script v2%s\n\n' "$BOLD" "$CYAN" "$NC"
     printf 'Usage: sudo %s [OPTION]\n\n' "$0"
-    printf 'Options:\n'
-    printf '  %s--all%s           Full deployment (driver + unlock + build llama.cpp)\n' "$GREEN" "$NC"
-    printf '  %s--driver%s        Install compatible NVIDIA driver only\n' "$GREEN" "$NC"
-    printf '  %s--unlock%s        Unlock PCIe + Compute only\n' "$GREEN" "$NC"
-    printf '  %s--verify%s        Verify unlock status only\n' "$GREEN" "$NC"
-    printf '  %s--build-llama%s   Build llama.cpp with DP2A patch only\n' "$GREEN" "$NC"
-    printf '  %s--benchmark%s     Run benchmark after build\n' "$GREEN" "$NC"
-    printf '  %s--status%s        Show current GPU status\n' "$GREEN" "$NC"
-    printf '  %s--deps%s          Install dependencies only\n' "$GREEN" "$NC"
-    printf '  %s--help%s          Show this help message\n' "$GREEN" "$NC"
-    printf '\n'
-    printf 'Examples:\n'
-    printf '  sudo %s --all            # First-time deployment\n' "$0"
-    printf '  sudo %s --driver         # Fix incompatible driver\n' "$0"
-    printf '  sudo %s --unlock         # After reboot (unlock is temporary)\n' "$0"
-    printf '  sudo %s --build-llama    # Rebuild llama.cpp after update\n' "$0"
-    printf '\n'
-    printf 'Requirements:\n'
-    printf '  - Linux x86_64\n'
-    printf '  - NVIDIA CMP 90HX (10de:220d)\n'
-    printf '  - NVIDIA Open Driver 580.159.03 or 610.43.03\n'
-    printf '  - CUDA Toolkit\n'
-    printf '  - Secure Boot disabled\n'
-    printf '\n'
-    printf 'Supported drivers:\n'
-    printf '  - 610.43.03 (recommended)\n'
-    printf '  - 580.159.03 (stable)\n'
-    printf '\n'
-    printf 'Source repositories:\n'
-    printf '  PCIe unlock:    https://github.com/pearlfortune/cmpunlocker\n'
-    printf '  HW research:    https://github.com/WildFlash1st/cmp90hx-unlock\n'
-    printf '  DP2A patch:     https://github.com/ggml-org/llama.cpp/issues/24616\n'
-    printf '\n'
+    printf '  %s--all%s           Full deployment\n' "$GREEN" "$NC"
+    printf '  %s--driver%s        Install compatible driver\n' "$GREEN" "$NC"
+    printf '  %s--unlock%s        Unlock PCIe + Compute\n' "$GREEN" "$NC"
+    printf '  %s--verify%s        Verify unlock\n' "$GREEN" "$NC"
+    printf '  %s--build-llama%s   Build llama.cpp + DP2A patch\n' "$GREEN" "$NC"
+    printf '  %s--benchmark%s     Run benchmark\n' "$GREEN" "$NC"
+    printf '  %s--status%s        GPU status\n' "$GREEN" "$NC"
+    printf '  %s--deps%s          Install dependencies\n' "$GREEN" "$NC"
+    printf '  %s--help%s          This help\n' "$GREEN" "$NC"
+    printf '\nSupported drivers: 610.43.03, 580.159.03\n'
+    printf 'Custom kernels: candidate auto-built from stockflow source.\n\n'
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 main() {
-    if [[ $# -eq 0 ]]; then
-        show_help
-        exit 0
-    fi
-
+    [[ $# -eq 0 ]] && { show_help; exit 0; }
     check_linux
-
     case "${1}" in
         --all)          deploy_all ;;
         --driver)       check_root; install_driver ;;
         --unlock)       unlock_pcie ;;
-        --verify)       verify_unlock ;;
-        --build-llama)  install_deps; build_llama ;;
+        --verify)       check_root; verify_unlock ;;
+        --build-llama)  check_root; install_deps; build_llama ;;
         --benchmark)    run_benchmark ;;
         --status)       show_status ;;
         --deps)         check_root; install_deps ;;
         --help|-h)      show_help ;;
-        *)
-            log_error "Unknown option: $1"
-            printf '\n'
-            show_help
-            exit 1
-            ;;
+        *)              log_error "Unknown: $1"; show_help; exit 1 ;;
     esac
 }
 
