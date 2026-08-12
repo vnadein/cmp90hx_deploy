@@ -92,8 +92,8 @@ Llama-2-7B Q4_0 Benchmark (`llama-bench -p 512 -n 128 -ngl 99`)
 
 | Metric | Stock CMP 90HX | After Script | RTX 3080 (reference) |
 |--------|----------------|--------------|----------------------|
-| pp512 (prompt processing) | ~374 t/s | ~378 t/s | ~3009 t/s |
-| tg128 (token generation) | ~57 t/s | ~114 t/s | ~78 t/s |
+| pp512 (prompt processing) | ~160.92 t/s | ~2655.57 t/s | ~3009 t/s |
+| tg128 (token generation) | ~37.20 t/s | ~108.25 t/s | ~78 t/s |
 
 Note: Token generation (tg) on CMP 90HX with DP2A patch exceeds RTX 3080 due to higher memory bandwidth utilization in decode phase.
 
