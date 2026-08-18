@@ -21,7 +21,7 @@ The **CMP 90HX** is a GA102-based GPU (same silicon as RTX 3080) with artificial
 
 | Parameter | Factory CMP 90HX | After Unlock |
 |-----------|-----------------|--------------|
-| PCIe Speed | Gen1 x1-4 (~0.85 GB/s) | **Gen3 x16 (~16 GB/s)** |
+| PCIe Speed | Gen1 x1-4 (~0.85 GB/s) | Gen1 x1-4 (~0.85 GB/s) |
 | DP4A Instruction | Throttled 16x | **Bypassed via DP2A patch** |
 | Token Generation | ~30-50 t/s | **~100-120 t/s** |
 | FP32 Compute | eFuse locked (1/32 speed) | Cannot be unlocked (hardware) |
